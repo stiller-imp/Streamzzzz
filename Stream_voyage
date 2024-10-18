@@ -1,0 +1,185 @@
+import vlc
+import time
+import requests
+import logging
+import subprocess
+import tkinter as tk
+from tkinter import messagebox, OptionMenu, StringVar, Listbox, Scrollbar, Entry, Label, BooleanVar, Checkbutton
+
+# Configure logging
+logging.basicConfig(filename="tv_stream.log", level=logging.INFO, 
+                    format="%(asctime)s:%(levelname)s:%(message)s")
+
+# Global variables for stream and VPN processes
+vpn_process = None
+player = None
+
+# URLs for playlists
+IPTV_ORG_URL = "https://iptv-org.github.io/iptv/index.m3u"
+FREE_TV_URL = "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8"
+
+# Function to fetch M3U data from a given URL
+def fetch_m3u_data(url):
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            return response.text
+        else:
+            logging.error(f"Failed to fetch M3U data: {response.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Error while fetching M3U data: {str(e)}")
+        return None
+
+# Parse M3U playlist to get channel information
+def parse_m3u(data):
+    channels = []
+    lines = data.splitlines()
+    for i in range(0, len(lines)):
+        if lines[i].startswith("#EXTINF"):
+            details = lines[i].split(",")[-1]
+            stream_url = lines[i+1]
+            channels.append({"details": details, "url": stream_url})
+    return channels
+
+# Get channels by country (this can be adjusted for different sources)
+def get_channels_by_country(channels):
+    country_channels = {}
+    for channel in channels:
+        country_code = channel["details"].split()[-1].upper()  # Example based on channel names
+        if country_code not in country_channels:
+            country_channels[country_code] = []
+        country_channels[country_code].append(channel)
+    return country_channels
+
+# Function to connect to NordVPN
+def connect_vpn(country_code):
+    try:
+        vpn_command = f"nordvpn connect {country_code}"
+        subprocess.run(vpn_command, shell=True)
+        time.sleep(10)  # Wait for VPN to establish
+        messagebox.showinfo("VPN", f"Connected to VPN in {country_code}")
+    except Exception as e:
+        messagebox.showerror("VPN Error", f"Failed to connect to VPN: {str(e)}")
+
+# Function to disconnect from NordVPN
+def disconnect_vpn():
+    try:
+        vpn_command = "nordvpn disconnect"
+        subprocess.run(vpn_command, shell=True)
+        messagebox.showinfo("VPN", "VPN Disconnected")
+    except Exception as e:
+        messagebox.showerror("VPN Error", f"Failed to disconnect VPN: {str(e)}")
+
+# Function to play the stream using VLC
+def play_stream(stream_url):
+    global player
+    try:
+        instance = vlc.Instance()
+        player = instance.media_player_new()
+        media = instance.media_new(stream_url)
+        player.set_media(media)
+        player.play()
+        logging.info("Started streaming from: " + stream_url)
+    except Exception as e:
+        logging.error("Failed to start stream: " + str(e))
+        messagebox.showerror("Stream Error", f"Failed to start stream: {str(e)}")
+
+# Function to stop the VLC player
+def stop_stream():
+    global player
+    if player:
+        player.stop()
+        player = None
+        logging.info("Stream stopped")
+        messagebox.showinfo("Stream", "Stream stopped")
+
+# Function to send stream to AWS MediaLive using FFmpeg
+def send_stream_to_aws(selected_stream_url, aws_media_live_url):
+    try:
+        # FFmpeg command to send the stream to AWS MediaLive
+        ffmpeg_command = f"ffmpeg -i {selected_stream_url} -c:v copy -c:a copy -f flv {aws_media_live_url}"
+        subprocess.run(ffmpeg_command, shell=True)
+        logging.info(f"Stream sent to AWS MediaLive at {aws_media_live_url}")
+        messagebox.showinfo("AWS MediaLive", f"Stream sent to AWS MediaLive: {aws_media_live_url}")
+    except Exception as e:
+        logging.error(f"Failed to send stream to AWS MediaLive: {str(e)}")
+        messagebox.showerror("AWS MediaLive Error", f"Failed to send stream to AWS MediaLive: {str(e)}")
+
+# Main GUI Application
+class VPNStreamApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("StreamVoyager")
+        self.geometry("500x600")
+        
+        # Create variables to store selected country and stream URL
+        self.selected_country = StringVar(self)
+        self.selected_channel = StringVar(self)
+        self.channels_by_country = {}
+        self.country_list = []
+        self.channels_listbox = None
+        self.aws_media_live_url = StringVar(self)
+        
+        # Variable to track if the user wants to use a VPN or not
+        self.use_vpn = BooleanVar()
+
+        # Setup layout using frames and grid layout
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Country selection
+        self.country_frame = tk.Frame(self)
+        self.country_frame.grid(row=0, column=0, padx=20, pady=10, sticky="ew")
+        
+        self.country_label = tk.Label(self.country_frame, text="Select Country:")
+        self.country_label.grid(row=0, column=0, padx=5, pady=5)
+
+        # Create options to select either IPTV-ORG or Free-TV playlist
+        self.playlist_label = tk.Label(self.country_frame, text="Choose Playlist Source:")
+        self.playlist_label.grid(row=1, column=0, padx=5, pady=5)
+
+        self.playlist_choice = tk.StringVar()
+        self.playlist_choice.set("IPTV-ORG")  # Default to IPTV-ORG
+        
+        self.playlist_org = tk.Radiobutton(self.country_frame, text="IPTV-ORG", variable=self.playlist_choice, value="IPTV-ORG", command=self.update_playlist)
+        self.playlist_org.grid(row=1, column=1, padx=5, pady=5)
+
+        self.playlist_free = tk.Radiobutton(self.country_frame, text="Free-TV", variable=self.playlist_choice, value="Free-TV", command=self.update_playlist)
+        self.playlist_free.grid(row=1, column=2, padx=5, pady=5)
+
+        self.country_menu = OptionMenu(self.country_frame, self.selected_country, [])
+        self.country_menu.grid(row=2, column=1, padx=5, pady=5)
+
+        # Create a listbox for channels with scrollbar
+        self.channel_frame = tk.Frame(self)
+        self.channel_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
+        
+        self.channel_label = tk.Label(self.channel_frame, text="Available Channels:")
+        self.channel_label.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.channels_listbox = Listbox(self.channel_frame, selectmode="single", width=50, height=10)
+        self.channels_listbox.grid(row=1, column=0, padx=5, pady=5, columnspan=2)
+        self.scrollbar = Scrollbar(self.channel_frame, orient="vertical")
+        self.scrollbar.grid(row=1, column=2, sticky="ns")
+        self.channels_listbox.config(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.config(command=self.channels_listbox.yview)
+
+        # AWS MediaLive Input URL
+        self.aws_frame = tk.Frame(self)
+        self.aws_frame.grid(row=4, column=0, padx=20, pady=10, sticky="ew")
+
+        self.aws_label = tk.Label(self.aws_frame, text="AWS MediaLive URL:")
+        self.aws_label.grid(row=0, column=0, padx=5, pady=5)
+
+        self.aws_entry = Entry(self.aws_frame, textvariable=self.aws_media_live_url, width=50)
+        self.aws_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        # Stream control buttons
+        self.stream_button_frame = tk.Frame(self)
+        self.stream_button_frame.grid(row=5, column=0, padx=20, pady=10)
+
+        self.play_button = tk.Button(self.stream_button_frame, text="Start Stream", command=self.start_stream_action)
+        self.play_button.grid(row=0, column=0, padx=5, pady=5)
+
+        self.stop_button =
